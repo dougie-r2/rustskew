@@ -1,2 +1,2 @@
-date,spot,call_gex_mm,put_gex_mm,net_gex_mm,total_oi
-2026-06-13,7431.46,257041.3,233619.0,23422.2,24985771
+date,spot,call_gex_mm,put_gex_mm,net_gex_mm,net_vex_mm,gexplus_mm,total_oi
+2026-06-12,7431.46,281435.9,256281.5,25154.4,49829.1,74983.5,25822512

@@ -282,9 +282,63 @@ struct GammaProfile {
     net_mm: f64,
     call_mm: f64,
     put_mm: f64,
+    net_vex_mm: f64,
     flip: f64,
     strikes: Vec<f64>,
     gex: Vec<f64>, // per-strike dealer GEX, $mm per 1% move
+    vex: Vec<f64>, // per-strike dealer VEX (vanna), $mm per 1 vol-pt move
+}
+
+#[derive(Serialize)]
+struct GexPoint {
+    date: String,
+    price: f64,
+    dix: f64,
+    gex: f64,
+}
+
+/// SqueezeMetrics free DIX/GEX history (DIX.csv: date,price,dix,gex). ~2011→now, SPX net GEX in $.
+fn read_dix() -> Vec<GexPoint> {
+    let mut out = Vec::new();
+    if let Ok(t) = std::fs::read_to_string("DIX.csv") {
+        for line in t.lines().skip(1) {
+            let f: Vec<&str> = line.trim().split(',').collect();
+            if f.len() < 4 {
+                continue;
+            }
+            if let (Ok(p), Ok(d), Ok(g)) =
+                (f[1].trim().parse(), f[2].trim().parse(), f[3].trim().parse())
+            {
+                out.push(GexPoint { date: f[0].trim().to_string(), price: p, dix: d, gex: g });
+            }
+        }
+    }
+    out
+}
+
+#[derive(Serialize)]
+struct GexPlusPt {
+    date: String,
+    spot: f64,
+    gex: f64,
+    vex: f64,
+    gexplus: f64,
+}
+
+/// Our forward GEX/VEX/GEX+ time series from collected CBOE snapshots (data/gamma_<UND>.csv).
+fn read_gexplus(und: &str) -> Vec<GexPlusPt> {
+    let mut out = Vec::new();
+    if let Ok(t) = std::fs::read_to_string(format!("data/gamma_{und}.csv")) {
+        for line in t.lines().skip(1) {
+            let f: Vec<&str> = line.trim().split(',').collect();
+            if f.len() < 7 {
+                continue;
+            }
+            let p = |i: usize| f[i].trim().parse::<f64>().unwrap_or(f64::NAN);
+            out.push(GexPlusPt { date: f[0].to_string(), spot: p(1), gex: p(4), vex: p(5), gexplus: p(6) });
+        }
+    }
+    out
 }
 
 fn snap_dates(und: &str) -> Vec<String> {
@@ -339,19 +393,29 @@ fn build_gamma(und: &str, date: &str) -> Option<GammaProfile> {
             -1.0
         }
     };
-    let factor = spot * spot * 0.01;
+    let factor = spot * spot * 0.01; // GEX: $ per 1% spot move
+    let vfac = spot * 0.01; // VEX: $ delta per 1 vol-point move
     let (lo, hi) = (spot * 0.80, spot * 1.20);
     let mut by: BTreeMap<i64, f64> = BTreeMap::new(); // strike*100 -> net $ GEX
-    let (mut call, mut put) = (0.0, 0.0);
-    for &(k, _dte, is_call, oi, g, _iv) in &opts {
-        let dollar = g * oi * 100.0 * factor;
-        if is_call {
-            call += dollar;
+    let mut vby: BTreeMap<i64, f64> = BTreeMap::new(); // strike*100 -> net $ VEX
+    let (mut call, mut put, mut net_vex) = (0.0, 0.0, 0.0);
+    for &(k, dte, is_call, oi, g, iv) in &opts {
+        let gd = g * oi * 100.0 * factor;
+        let vanna = if (0.01..=2.0).contains(&iv) {
+            bs::bs_vanna(spot, k, dte / 365.0, iv)
         } else {
-            put += dollar;
+            0.0
+        };
+        let vd = vanna * oi * 100.0 * vfac;
+        if is_call {
+            call += gd;
+        } else {
+            put += gd;
         }
+        net_vex += sgn(is_call) * vd;
         if k >= lo && k <= hi {
-            *by.entry((k * 100.0) as i64).or_default() += sgn(is_call) * dollar;
+            *by.entry((k * 100.0) as i64).or_default() += sgn(is_call) * gd;
+            *vby.entry((k * 100.0) as i64).or_default() += sgn(is_call) * vd;
         }
     }
     let net = if vix { -call + put } else { call - put };
@@ -394,9 +458,11 @@ fn build_gamma(und: &str, date: &str) -> Option<GammaProfile> {
         net_mm: net / 1e6,
         call_mm: call / 1e6,
         put_mm: put / 1e6,
+        net_vex_mm: net_vex / 1e6,
         flip,
         strikes: by.keys().map(|k| *k as f64 / 100.0).collect(),
         gex: by.values().map(|v| v / 1e6).collect(),
+        vex: vby.values().map(|v| v / 1e6).collect(),
     })
 }
 
@@ -429,10 +495,21 @@ fn handle(mut stream: TcpStream, ohlc: &str, dates_json: &str, symbol: &str) {
         "/" | "/candles" => respond(&mut stream, "200 OK", "text/html; charset=utf-8", page(CANDLE_HTML).as_bytes()),
         "/surface" => respond(&mut stream, "200 OK", "text/html; charset=utf-8", page(SURFACE_HTML).as_bytes()),
         "/gamma" => respond(&mut stream, "200 OK", "text/html; charset=utf-8", page(GAMMA_HTML).as_bytes()),
+        "/gex" => respond(&mut stream, "200 OK", "text/html; charset=utf-8", page(GEX_HTML).as_bytes()),
+        "/gexplus" => respond(&mut stream, "200 OK", "text/html; charset=utf-8", page(GEXPLUS_HTML).as_bytes()),
         "/api/ohlc" => respond(&mut stream, "200 OK", "application/json", ohlc.as_bytes()),
         "/api/dates" => respond(&mut stream, "200 OK", "application/json", dates_json.as_bytes()),
         "/api/surface" => {
             let body = serde_json::to_string(&build_surface(symbol, q("date"))).unwrap_or_else(|_| "{}".into());
+            respond(&mut stream, "200 OK", "application/json", body.as_bytes());
+        }
+        "/api/gex_history" => {
+            let body = serde_json::to_string(&read_dix()).unwrap_or_else(|_| "[]".into());
+            respond(&mut stream, "200 OK", "application/json", body.as_bytes());
+        }
+        "/api/gexplus" => {
+            let und = if q("und").is_empty() { "SPX" } else { q("und") };
+            let body = serde_json::to_string(&read_gexplus(und)).unwrap_or_else(|_| "[]".into());
             respond(&mut stream, "200 OK", "application/json", body.as_bytes());
         }
         "/api/gamma_dates" => {
@@ -489,7 +566,7 @@ pub fn run(symbol: &str) {
 }
 
 const NAV: &str = r#"<header><h1>Skew Analytics</h1>
-<nav><a href="/candles" id="nav-c">Candles</a><a href="/surface" id="nav-s">Vol Surface</a><a href="/gamma" id="nav-g">Dealer Gamma</a></nav></header>"#;
+<nav><a href="/candles" id="nav-c">Candles</a><a href="/surface" id="nav-s">Vol Surface</a><a href="/gamma" id="nav-g">Dealer Gamma</a><a href="/gex" id="nav-x">Net GEX</a><a href="/gexplus" id="nav-p">GEX+</a></nav></header>"#;
 
 const STYLE: &str = r#"
   :root{--bg:#06080d;--panel:#0d1420;--line:#1c2738;--txt:#cdd6e5;--dim:#7c8aa0;--accent:#5ccfe6}
@@ -728,6 +805,7 @@ const GAMMA_HTML: &str = r###"<!DOCTYPE html><html lang="en"><head><meta charset
   <div class="toolbar">
     <span>underlying <select id="undSel"><option>SPX</option><option>VIX</option></select></span>
     <span>date <select id="dateSel"></select></span>
+    <span>metric <select id="metricSel"><option>GEX</option><option>VEX</option></select></span>
     <span id="info"></span>
     <span style="margin-left:auto"><span class="pos">■</span> long gamma (vol-suppressing) · <span class="neg">■</span> short gamma (accelerant) · <span class="spotc">│</span> spot · <span class="flipc">┊</span> γ-flip</span>
   </div>
@@ -740,20 +818,26 @@ window.addEventListener('resize',()=>chart.resize());
 const undSel=document.getElementById('undSel'),dateSel=document.getElementById('dateSel'),info=document.getElementById('info');
 const AX={axisLine:{lineStyle:{color:'#33415a'}},axisLabel:{color:'#8595ad'},nameTextStyle:{color:'#8595ad'}};
 function fmt(v){return (v>=0?'+':'')+v.toLocaleString(undefined,{maximumFractionDigits:0});}
-function render(g){
+let lastG=null;
+function render(g){ lastG=g; draw(); }
+function draw(){
+  const g=lastG;
   if(!g){info.textContent='no snapshot for this date';chart.clear();return;}
-  const bn=v=>(v/1000); // $mm -> $bn
-  info.innerHTML=`<span class="stat">net <b class="${g.net_mm>=0?'pos':'neg'}">${fmt(g.net_mm)}</b> $mm/1%  ·  call <b>${fmt(g.call_mm)}</b> · put <b>${fmt(g.put_mm)}</b>  ·  spot <b class="spotc">${g.spot.toFixed(0)}</b>  ·  γ-flip <b class="flipc">${g.flip&&isFinite(g.flip)?g.flip.toFixed(0):'—'}</b></span>`;
-  const data=g.strikes.map((k,i)=>[k,g.gex[i]]);
+  const metric=document.getElementById('metricSel').value;
+  const arr=metric==='VEX'?g.vex:g.gex;
+  const yName=metric==='VEX'?'Dealer VEX / vanna  ($mm / 1 vol-pt)':'Dealer GEX  ($mm / 1% move)';
+  const unit=metric==='VEX'?'$mm/volpt':'$mm/1%';
+  info.innerHTML=`<span class="stat">net GEX <b class="${g.net_mm>=0?'pos':'neg'}">${fmt(g.net_mm)}</b> · net VEX <b class="${g.net_vex_mm>=0?'pos':'neg'}">${fmt(g.net_vex_mm)}</b> $mm  ·  spot <b class="spotc">${g.spot.toFixed(0)}</b>  ·  γ-flip <b class="flipc">${g.flip&&isFinite(g.flip)?g.flip.toFixed(0):'—'}</b></span>`;
+  const data=g.strikes.map((k,i)=>[k,arr[i]]);
   const ml=[{xAxis:g.spot,lineStyle:{color:'#4fc3f7',width:1.5},label:{formatter:'spot',color:'#4fc3f7',position:'insideEndTop'}}];
   if(g.flip&&isFinite(g.flip)) ml.push({xAxis:g.flip,lineStyle:{color:'#ffb454',width:1.5,type:'dashed'},label:{formatter:'γ-flip',color:'#ffb454',position:'insideEndBottom'}});
   chart.setOption({
     backgroundColor:'transparent',
     grid:{left:78,right:28,top:24,bottom:64},
     tooltip:{trigger:'axis',axisPointer:{type:'shadow'},backgroundColor:'#0b1220',borderColor:'#1c2738',textStyle:{color:'#cdd6e5'},
-      formatter:p=>{const d=p[0].data;return `strike ${d[0]}<br/>GEX ${fmt(d[1])} $mm/1%`;}},
+      formatter:p=>{const d=p[0].data;return `strike ${d[0]}<br/>${metric} ${fmt(d[1])} ${unit}`;}},
     xAxis:Object.assign({type:'value',name:'Strike',scale:true,splitLine:{show:false}},AX),
-    yAxis:Object.assign({type:'value',name:'Dealer GEX  ($mm / 1% move)',splitLine:{lineStyle:{color:'#141d2b'}}},AX),
+    yAxis:Object.assign({type:'value',name:yName,splitLine:{lineStyle:{color:'#141d2b'}}},AX),
     dataZoom:[{type:'inside'},{type:'slider',height:16,bottom:8,borderColor:'#1c2738',textStyle:{color:'#8595ad'}}],
     series:[{type:'bar',data,barWidth:'70%',
       itemStyle:{color:p=>p.value[1]>=0?'#26a69a':'#ef5350'},
@@ -773,5 +857,95 @@ async function loadDates(){
 }
 undSel.addEventListener('change',loadDates);
 dateSel.addEventListener('change',loadGamma);
+document.getElementById('metricSel').addEventListener('change',draw);
 loadDates();
+</script></body></html>"###;
+
+const GEX_HTML: &str = r###"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Skew Analytics — Net GEX</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>__STYLE__
+  .wrap{padding:0}
+  .sub{padding:10px 20px;font-size:12.5px;color:var(--dim)}
+  #gex{height:calc(100vh - 130px);width:100%}
+  .neg{color:#ef5350} .pos{color:#26a69a}
+</style></head><body>__NAV__
+<div class="wrap">
+  <div class="sub"><b style="color:var(--txt)">Net Dealer Gamma (GEX) — SPX, 2011→now</b> (SqueezeMetrics) · <span class="neg">red = negative</span> (short gamma / accelerant) · <span class="pos">green = positive</span> (long gamma, vol-suppressing) · grey = SPX (log) · <span id="info"></span></div>
+  <div id="gex"></div>
+</div>
+<script>
+document.getElementById('nav-x').classList.add('active');
+const AX={axisLine:{lineStyle:{color:'#33415a'}},axisLabel:{color:'#8595ad'},nameTextStyle:{color:'#8595ad'}};
+const chart=echarts.init(document.getElementById('gex'),null,{renderer:'canvas'});
+window.addEventListener('resize',()=>chart.resize());
+(async function(){
+  const d=await (await fetch('/api/gex_history')).json();
+  if(!d.length){document.getElementById('info').textContent='no DIX.csv';return;}
+  const xs=d.map(p=>p.date);
+  const gex=d.map(p=>+(p.gex/1e9).toFixed(3));
+  const spx=d.map(p=>p.price);
+  const neg=d.filter(p=>p.gex<0).length;
+  document.getElementById('info').textContent=`${d.length} days · ${neg} negative (${(neg/d.length*100).toFixed(1)}%)`;
+  chart.setOption({
+    backgroundColor:'transparent',
+    grid:{left:74,right:66,top:18,bottom:72},
+    tooltip:{trigger:'axis',backgroundColor:'#0b1220',borderColor:'#1c2738',textStyle:{color:'#cdd6e5'}},
+    dataZoom:[{type:'inside'},{type:'slider',height:18,bottom:12,borderColor:'#1c2738',textStyle:{color:'#8595ad'}}],
+    xAxis:Object.assign({type:'category',data:xs,boundaryGap:false},AX),
+    yAxis:[
+      Object.assign({type:'value',name:'GEX  $bn / 1%',splitLine:{lineStyle:{color:'#141d2b'}}},AX),
+      Object.assign({type:'value',name:'SPX',position:'right',splitLine:{show:false}},AX)
+    ],
+    series:[
+      {name:'GEX',type:'line',data:gex,showSymbol:false,sampling:'lttb',lineStyle:{color:'#26c6da',width:1.4},areaStyle:{color:'rgba(38,198,218,0.10)'},z:3,
+        markLine:{symbol:'none',silent:true,data:[{yAxis:0,lineStyle:{color:'#7a8aa0',type:'dashed',width:1}}]}},
+      {name:'SPX',type:'line',yAxisIndex:1,data:spx,showSymbol:false,sampling:'lttb',lineStyle:{color:'#8593a8',width:1},z:1}
+    ]
+  });
+})();
+</script></body></html>"###;
+
+const GEXPLUS_HTML: &str = r###"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Skew Analytics — GEX+</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>__STYLE__
+  .wrap{padding:0}
+  .sub{padding:10px 20px;font-size:12.5px;color:var(--dim)}
+  #gp{height:calc(100vh - 130px);width:100%}
+</style></head><body>__NAV__
+<div class="wrap">
+  <div class="sub"><b style="color:var(--txt)">GEX+ = GEX + VEX</b> — forward series from our CBOE snapshots (grows daily; naive sign) · <span style="color:#26c6da">GEX</span> · <span style="color:#ffb454">VEX</span> · <span style="color:#e6ecf5">GEX+</span> · grey = SPX · <span id="info"></span></div>
+  <div id="gp"></div>
+</div>
+<script>
+document.getElementById('nav-p').classList.add('active');
+const AX={axisLine:{lineStyle:{color:'#33415a'}},axisLabel:{color:'#8595ad'},nameTextStyle:{color:'#8595ad'}};
+const chart=echarts.init(document.getElementById('gp'),null,{renderer:'canvas'});
+window.addEventListener('resize',()=>chart.resize());
+(async function(){
+  const d=await (await fetch('/api/gexplus?und=SPX')).json();
+  if(!d.length){document.getElementById('info').textContent='no snapshots yet — run skew update';return;}
+  const xs=d.map(p=>p.date), last=d[d.length-1];
+  document.getElementById('info').textContent=`${d.length} day(s) · latest GEX ${last.gex.toFixed(0)} · VEX ${last.vex.toFixed(0)} · GEX+ ${last.gexplus.toFixed(0)} $mm`;
+  const line=(name,key,color,w)=>({name,type:'line',data:d.map(p=>p[key]),showSymbol:true,symbolSize:5,lineStyle:{color,width:w||1.5},itemStyle:{color}});
+  chart.setOption({
+    backgroundColor:'transparent',
+    legend:{data:['GEX','VEX','GEX+'],textStyle:{color:'#aeb6c4'},top:6},
+    grid:{left:74,right:66,top:38,bottom:64},
+    tooltip:{trigger:'axis',backgroundColor:'#0b1220',borderColor:'#1c2738',textStyle:{color:'#cdd6e5'}},
+    dataZoom:[{type:'inside'},{type:'slider',height:16,bottom:8,borderColor:'#1c2738',textStyle:{color:'#8595ad'}}],
+    xAxis:Object.assign({type:'category',data:xs,boundaryGap:false},AX),
+    yAxis:[
+      Object.assign({type:'value',name:'$mm',splitLine:{lineStyle:{color:'#141d2b'}}},AX),
+      Object.assign({type:'value',name:'SPX',position:'right',splitLine:{show:false}},AX)
+    ],
+    series:[
+      line('GEX','gex','#26c6da'),
+      line('VEX','vex','#ffb454'),
+      Object.assign(line('GEX+','gexplus','#e6ecf5',2.2),{markLine:{symbol:'none',silent:true,data:[{yAxis:0,lineStyle:{color:'#7a8aa0',type:'dashed',width:1}}]}}),
+      {name:'SPX',type:'line',yAxisIndex:1,data:d.map(p=>p.spot),showSymbol:false,lineStyle:{color:'#5b6678',width:1},z:1}
+    ]
+  });
+})();
 </script></body></html>"###;

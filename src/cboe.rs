@@ -10,6 +10,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::bs;
 use crate::dates;
 use crate::fetch::curl_get;
 
@@ -39,7 +40,8 @@ pub struct Gamma {
     pub spot: f64,
     pub call_gex: f64, // $ gamma per 1% move (magnitude, call side)
     pub put_gex: f64,
-    pub net_gex: f64, // dealer net (sign convention per underlying)
+    pub net_gex: f64, // dealer net GEX (sign convention per underlying)
+    pub net_vex: f64, // dealer net VEX / vanna ($ per 1 vol-pt)
     pub total_oi: f64,
 }
 
@@ -61,13 +63,28 @@ fn parse_occ(sym: &str) -> Option<(f64, bool, i64)> {
     Some((strike, is_call, dates::days_from_civil(2000 + yy, mm, dd)))
 }
 
+/// CBOE timestamps with the fetch time, but the data is the last completed
+/// session. Roll weekends back to the prior Friday so snapshots carry the real
+/// trading date (e.g. a Saturday fetch is Friday's EOD data).
+fn session_date(raw: &str) -> String {
+    match dates::parse_ymd(raw) {
+        Some(mut d) => {
+            while dates::is_weekend(d) {
+                d -= 1;
+            }
+            dates::fmt_ymd(d)
+        }
+        None => raw.to_string(),
+    }
+}
+
 /// Fetch the current chain for a CBOE symbol (e.g. `_SPX`, `_VIX`).
 pub fn fetch_chain(symbol: &str) -> Result<Chain, String> {
     let url = format!("{CBOE}{symbol}.json");
     let bytes = curl_get(&url)?;
     let v: Value = serde_json::from_slice(&bytes).map_err(|e| format!("cboe json: {e}"))?;
     let ts = v["timestamp"].as_str().unwrap_or("").to_string();
-    let date = ts.get(0..10).unwrap_or("").to_string();
+    let date = session_date(ts.get(0..10).unwrap_or(""));
     let d0 = dates::parse_ymd(&date).ok_or("cboe: bad timestamp date")?;
     let data = &v["data"];
     let spot = data["current_price"].as_f64().ok_or("cboe: no spot")?;
@@ -104,8 +121,18 @@ pub fn fetch_chain(symbol: &str) -> Result<Chain, String> {
 /// `gamma * OI * 100 * spot^2 * 0.01` = $ per 1% move. Sign convention:
 /// equity index -> dealers long calls / short puts; VIX -> dealers short calls.
 pub fn dealer_gamma(ch: &Chain, vix: bool) -> Gamma {
-    let factor = ch.spot * ch.spot * 0.01;
-    let (mut call, mut put, mut oi) = (0.0, 0.0, 0.0);
+    let factor = ch.spot * ch.spot * 0.01; // GEX: $ per 1% spot move
+    let vfac = ch.spot * 0.01; // VEX: $ delta per 1 vol-pt move
+    let sgn = |is_call: bool| -> f64 {
+        if vix {
+            if is_call { -1.0 } else { 1.0 }
+        } else if is_call {
+            1.0
+        } else {
+            -1.0
+        }
+    };
+    let (mut call, mut put, mut oi, mut net_vex) = (0.0, 0.0, 0.0, 0.0);
     for o in &ch.opts {
         let g = o.gamma * o.oi * 100.0 * factor;
         if o.is_call {
@@ -113,10 +140,24 @@ pub fn dealer_gamma(ch: &Chain, vix: bool) -> Gamma {
         } else {
             put += g;
         }
+        let vanna = if (0.01..=2.0).contains(&o.iv) {
+            bs::bs_vanna(ch.spot, o.strike, o.dte / 365.0, o.iv)
+        } else {
+            0.0
+        };
+        net_vex += sgn(o.is_call) * vanna * o.oi * 100.0 * vfac;
         oi += o.oi;
     }
     let net = if vix { -call + put } else { call - put };
-    Gamma { date: ch.date.clone(), spot: ch.spot, call_gex: call, put_gex: put, net_gex: net, total_oi: oi }
+    Gamma {
+        date: ch.date.clone(),
+        spot: ch.spot,
+        call_gex: call,
+        put_gex: put,
+        net_gex: net,
+        net_vex,
+        total_oi: oi,
+    }
 }
 
 /// Fetch, store a compact snapshot (skip if today's already stored), and append
@@ -150,18 +191,19 @@ pub fn update_underlying(label: &str, symbol: &str, vix: bool) -> Result<String,
         .open(&gpath)
         .map_err(|e| e.to_string())?;
     if new {
-        let _ = f.write_all(b"date,spot,call_gex_mm,put_gex_mm,net_gex_mm,total_oi\n");
+        let _ = f.write_all(b"date,spot,call_gex_mm,put_gex_mm,net_gex_mm,net_vex_mm,gexplus_mm,total_oi\n");
     }
     let _ = f.write_all(
         format!(
-            "{},{:.2},{:.1},{:.1},{:.1},{:.0}\n",
-            g.date, g.spot, g.call_gex / 1e6, g.put_gex / 1e6, g.net_gex / 1e6, g.total_oi
+            "{},{:.2},{:.1},{:.1},{:.1},{:.1},{:.1},{:.0}\n",
+            g.date, g.spot, g.call_gex / 1e6, g.put_gex / 1e6, g.net_gex / 1e6,
+            g.net_vex / 1e6, (g.net_gex + g.net_vex) / 1e6, g.total_oi
         )
         .as_bytes(),
     );
     Ok(format!(
-        "{label} {}: spot {:.0} · net dealer gamma {:+.0} $mm/1% (call {:.0}, put {:.0}) · {} contracts",
-        g.date, g.spot, g.net_gex / 1e6, g.call_gex / 1e6, g.put_gex / 1e6, ch.opts.len()
+        "{label} {}: spot {:.0} · GEX {:+.0} · VEX {:+.0} · GEX+ {:+.0} $mm · {} contracts",
+        g.date, g.spot, g.net_gex / 1e6, g.net_vex / 1e6, (g.net_gex + g.net_vex) / 1e6, ch.opts.len()
     ))
 }
 

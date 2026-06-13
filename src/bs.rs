@@ -74,6 +74,17 @@ pub fn bs_gamma(s: f64, k: f64, t: f64, sigma: f64) -> f64 {
     norm_pdf(d1) / (s * sigma * sqrt_t)
 }
 
+/// Black-Scholes vanna (r = q = 0): ∂²price/∂S∂σ = ∂delta/∂σ.
+pub fn bs_vanna(s: f64, k: f64, t: f64, sigma: f64) -> f64 {
+    if s <= 0.0 || k <= 0.0 || t <= 0.0 || sigma <= 0.0 {
+        return 0.0;
+    }
+    let sqrt_t = t.sqrt();
+    let d1 = ((s / k).ln() + 0.5 * sigma * sigma * t) / (sigma * sqrt_t);
+    let d2 = d1 - sigma * sqrt_t;
+    -norm_pdf(d1) * d2 / sigma
+}
+
 /// Black-Scholes price (r = q = 0). `is_call` selects call vs put.
 pub fn bs_price(is_call: bool, s: f64, k: f64, t: f64, sigma: f64) -> f64 {
     if t <= 0.0 || sigma <= 0.0 {
