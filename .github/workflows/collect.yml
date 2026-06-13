@@ -1,0 +1,49 @@
+name: collect
+
+# Daily forward-only data collection: refresh price + take today's CBOE
+# option snapshot (SPX, VIX) + dealer gamma, then commit the new data back.
+#
+# Idempotent: on weekends/holidays CBOE still serves the last trading day, whose
+# snapshot is already stored, so those runs make no changes (no commit).
+
+on:
+  schedule:
+    # 22:00 UTC on weekdays = 6pm EDT / 5pm EST, i.e. after the 4pm ET close.
+    # (GitHub cron is UTC and may be delayed/occasionally skipped — fine for EOD.)
+    - cron: "0 22 * * 1-5"
+  workflow_dispatch: {}   # allow manual "Run workflow"
+
+permissions:
+  contents: write          # let the job push the committed data
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Update data (price + CBOE snapshot + dealer gamma)
+        run: ./target/release/skew update
+
+      - name: Commit new data
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A data
+          if git diff --cached --quiet; then
+            echo "no new data (non-trading day or already collected)"
+          else
+            git commit -m "data: $(date -u +%F) snapshot"
+            git push
+          fi

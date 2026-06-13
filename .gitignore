@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target
+
+# logs
+*.log
+
+# large, regenerable historical cache (re-fetch with `skew backfill SPY`)
+/data/dolt/
+
+# derived/output (regenerate with `skew backfill` + `skew report`)
+/out/
+
+# copyrighted source material — DO NOT publish
+*.pdf
+*.PNG
+*.png
+cm_yt*.txt
