@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::{bs, dates, fetch, price};
+use crate::{bs, dates, fetch, fred, price, svi};
 
 const NX: usize = 40; // moneyness grid points
 const NY: usize = 30; // dte grid points
@@ -24,7 +24,6 @@ struct Pt {
     date: String,
     skew_norm: f64,
     atm_iv: f64,
-    ts_ratio: f64,
     skew_pct: f64,
     iv_pct: f64,
 }
@@ -39,8 +38,23 @@ struct Ohlc {
     skew_pct: f64,
     iv_pct: f64,
     iv: f64,   // forward-filled ATM IV (browser recomputes spot-up-vol-up at any lookback)
-    tsr: f64,  // forward-filled term-structure ratio (browser runs inversion-onset hysteresis)
     sig: bool,
+    top: bool, // ML top (고점) signal  — orange
+    bot: bool, // ML bottom (저점) signal — teal
+}
+
+/// Load the ML turning-point signals (data/signals.csv: date,top,bottom).
+fn load_signals() -> std::collections::HashMap<String, (bool, bool)> {
+    let mut m = std::collections::HashMap::new();
+    if let Ok(txt) = std::fs::read_to_string("data/signals.csv") {
+        for line in txt.lines().skip(1) {
+            let f: Vec<&str> = line.split(',').collect();
+            if f.len() >= 3 {
+                m.insert(f[0].to_string(), (f[1].trim() == "1", f[2].trim() == "1"));
+            }
+        }
+    }
+    m
 }
 
 #[derive(Serialize)]
@@ -88,7 +102,6 @@ fn build_series(symbol: &str) -> Result<Vec<Pt>, String> {
             date: f[0].to_string(),
             skew_norm: g(5),
             atm_iv: g(3),
-            ts_ratio: g(9),
             skew_pct: f64::NAN,
             iv_pct: f64::NAN,
         });
@@ -102,44 +115,116 @@ fn build_series(symbol: &str) -> Result<Vec<Pt>, String> {
     Ok(pts)
 }
 
+/// (25Δ skew_norm, ATM IV) ~30DTE from a daily CBOE SPX snapshot.
+/// ATM = ~50Δ call; skew_norm = (IV@25Δ-put − IV@25Δ-call) / ATM-IV.
+fn snapshot_skew_iv(date: &str) -> Option<(f64, f64)> {
+    let text = std::fs::read_to_string(format!("data/snap/SPX/{date}.csv")).ok()?;
+    let (mut atm, mut natm, mut atmw, mut natmw) = (0.0f64, 0usize, 0.0f64, 0usize);
+    let (mut c25, mut nc25, mut p25, mut np25) = (0.0f64, 0usize, 0.0f64, 0usize);
+    for line in text.lines() {
+        if line.starts_with('#') || line.starts_with("strike") {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        if f.len() < 7 {
+            continue;
+        }
+        let is_call = f[2] == "C";
+        let g = |i: usize| f[i].parse::<f64>().ok();
+        if let (Some(dte), Some(delta), Some(iv)) = (g(1), g(5), g(6)) {
+            if !(0.01..=2.0).contains(&iv) || !(20.0..=45.0).contains(&dte) {
+                continue;
+            }
+            if is_call {
+                if (0.45..=0.55).contains(&delta) { atm += iv; natm += 1; }
+                if (0.40..=0.60).contains(&delta) { atmw += iv; natmw += 1; }
+                if (0.20..=0.30).contains(&delta) { c25 += iv; nc25 += 1; }
+            } else if (-0.30..=-0.20).contains(&delta) {
+                p25 += iv; np25 += 1;
+            }
+        }
+    }
+    let atm_iv = if natm > 0 { atm / natm as f64 }
+        else if natmw > 0 { atmw / natmw as f64 }
+        else { return None };
+    let skew_norm = if nc25 > 0 && np25 > 0 && atm_iv > 0.0 {
+        (p25 / np25 as f64 - c25 / nc25 as f64) / atm_iv
+    } else {
+        f64::NAN
+    };
+    Some((skew_norm, atm_iv))
+}
+
+/// date -> (25Δ skew_norm, ATM IV) for every available daily SPX snapshot (CI-updated).
+fn snapshot_map() -> std::collections::HashMap<String, (f64, f64)> {
+    let mut m = std::collections::HashMap::new();
+    if let Ok(rd) = std::fs::read_dir("data/snap/SPX") {
+        for e in rd.flatten() {
+            if let Some(stem) = e.path().file_stem().and_then(|x| x.to_str()) {
+                if let Some(v) = snapshot_skew_iv(stem) {
+                    m.insert(stem.to_string(), v);
+                }
+            }
+        }
+    }
+    m
+}
+
 fn build_ohlc(symbol: &str) -> Result<Vec<Ohlc>, String> {
     let cache = fetch::default_cache_root();
     let bars = price::load_ohlc(Path::new(&cache))?;
     let pts = build_series(symbol)?;
     let start = pts.first().map(|p| p.date.clone()).unwrap_or_default();
-    let sorted: Vec<(String, (f64, f64, f64, f64))> = pts
+    // RAW (skew_norm, atm_iv) from the Dolt history series (frozen at its last date).
+    let sorted: Vec<(String, (f64, f64))> = pts
         .iter()
-        .map(|p| (p.date.clone(), (p.skew_pct, p.iv_pct, p.atm_iv, p.ts_ratio)))
+        .map(|p| (p.date.clone(), (p.skew_norm, p.atm_iv)))
         .collect();
     let bars: Vec<_> = bars.into_iter().filter(|b| b.0 >= start).collect();
     let n = bars.len();
-    let (mut skp, mut ivp, mut ivff, mut tsff) =
-        (vec![f64::NAN; n], vec![f64::NAN; n], vec![f64::NAN; n], vec![f64::NAN; n]);
+    let (mut rskew, mut ivff) = (vec![f64::NAN; n], vec![f64::NAN; n]);
     let mut j = 0;
-    let mut last = (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+    let mut last = (f64::NAN, f64::NAN);
     for i in 0..n {
         while j < sorted.len() && sorted[j].0 <= bars[i].0 {
             last = sorted[j].1;
             j += 1;
         }
-        skp[i] = last.0;
-        ivp[i] = last.1;
-        ivff[i] = last.2;
-        tsff[i] = last.3;
+        rskew[i] = last.0;
+        ivff[i] = last.1;
     }
-    let lb = 5;
+    // Splice daily SPX-snapshot raw values (25Δ skew_norm, ATM IV) over the Dolt-frozen
+    // forward-fill, so the skew%/IV% panels AND the spot-up-vol-up marker all keep
+    // updating from the option data CI collects every day.
+    let snap = snapshot_map();
+    for i in 0..n {
+        if let Some(&(sk, iv)) = snap.get(&bars[i].0) {
+            if sk.is_finite() {
+                rskew[i] = sk;
+            }
+            if iv.is_finite() {
+                ivff[i] = iv;
+            }
+        }
+    }
+    // bar-level rolling percentiles (now live through the latest snapshot)
+    let skp = rolling_pct(&rskew, PCT_WIN);
+    let ivp = rolling_pct(&ivff, PCT_WIN);
+    let lb = 1;
+    let signals = load_signals();
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let b = &bars[i];
-        // default spot-up-vol-up (5d); the browser recomputes at any lookback from `iv`.
+        // default spot-up-vol-up (1d); the browser recomputes at any lookback from `iv`.
         let sig = i >= lb
             && ivff[i].is_finite()
             && ivff[i - lb].is_finite()
             && b.4 > bars[i - lb].4
             && ivff[i] > ivff[i - lb];
+        let (top, bot) = signals.get(&b.0).copied().unwrap_or((false, false));
         out.push(Ohlc {
             date: b.0.clone(), o: b.1, h: b.2, l: b.3, c: b.4,
-            skew_pct: skp[i], iv_pct: ivp[i], iv: ivff[i], tsr: tsff[i], sig,
+            skew_pct: skp[i], iv_pct: ivp[i], iv: ivff[i], sig, top, bot,
         });
     }
     Ok(out)
@@ -249,7 +334,24 @@ fn build_surface(symbol: &str, date: &str) -> Surface {
         if smile.len() < 4 {
             continue;
         }
-        let row: Vec<f64> = moneyness.iter().map(|&m| interp(&smile, m)).collect();
+        // SVI fit per expiry in (log-moneyness, total variance); fall back to linear interp.
+        let t = (dte as f64) / 365.0;
+        let pts: Vec<(f64, f64)> = smile.iter().map(|&(m, iv)| (m.ln(), iv * iv * t)).collect();
+        // clamp evaluation to the quoted log-moneyness range (flat-extrapolate beyond,
+        // so SVI wings don't blow up where there are no real strikes).
+        let kmin = pts.first().map(|p| p.0).unwrap_or(f64::NEG_INFINITY);
+        let kmax = pts.last().map(|p| p.0).unwrap_or(f64::INFINITY);
+        let row: Vec<f64> = match svi::fit(&pts) {
+            Some(s) => moneyness
+                .iter()
+                .map(|&m| {
+                    let k = m.ln().clamp(kmin, kmax);
+                    let w = s.w(k);
+                    if w > 0.0 && t > 0.0 { (w / t).sqrt() } else { f64::NAN }
+                })
+                .collect(),
+            None => moneyness.iter().map(|&m| interp(&smile, m)).collect(),
+        };
         exp_rows.push((dte as f64, row));
     }
     if exp_rows.len() < 2 {
@@ -340,6 +442,134 @@ fn read_gexplus(und: &str) -> Vec<GexPlusPt> {
     }
     out
 }
+
+// ---- McElligott skew / VIX vol-of-vol panels ----
+
+#[derive(Serialize)]
+struct VixSkewPt {
+    date: String,
+    ratio: f64, // IV(25Δ call) / IV(ATM call) at ~3M  (cm3)
+    iv_atm: f64,
+    iv_25c: f64,
+    spot: f64,
+}
+
+/// cm3: VIX 3M (≈90 DTE) call skew = IV(25Δ call)/IV(ATM call), per stored VIX snapshot.
+fn build_vix_call_skew() -> Vec<VixSkewPt> {
+    let mut out = Vec::new();
+    for date in snap_dates("VIX") {
+        let Ok(text) = std::fs::read_to_string(format!("data/snap/VIX/{date}.csv")) else { continue };
+        let mut spot = f64::NAN;
+        let mut by: BTreeMap<i64, Vec<(f64, f64)>> = BTreeMap::new(); // dte -> (call delta, iv)
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("# spot,") {
+                spot = rest.split(',').next().and_then(|x| x.parse().ok()).unwrap_or(f64::NAN);
+                continue;
+            }
+            if line.starts_with("strike") {
+                continue;
+            }
+            let f: Vec<&str> = line.split(',').collect();
+            if f.len() < 7 || f[2] != "C" {
+                continue;
+            }
+            // strike,dte,cp,oi,gamma,delta,iv,...
+            let (Ok(dte), Ok(delta), Ok(iv)) =
+                (f[1].parse::<f64>(), f[5].parse::<f64>(), f[6].parse::<f64>())
+            else {
+                continue;
+            };
+            if iv > 0.01 && iv < 10.0 && delta > 0.0 && delta < 1.0 {
+                by.entry(dte.round() as i64).or_default().push((delta, iv));
+            }
+        }
+        if !spot.is_finite() {
+            continue;
+        }
+        // expiry nearest 90 DTE with enough strikes
+        let mut chosen: Option<Vec<(f64, f64)>> = None;
+        let mut bestd = i64::MAX;
+        for (&dte, v) in &by {
+            if v.len() < 4 {
+                continue;
+            }
+            let d = (dte - 90).abs();
+            if d < bestd {
+                bestd = d;
+                chosen = Some(v.clone());
+            }
+        }
+        let Some(mut smile) = chosen else { continue };
+        smile.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap()); // by delta ascending
+        let iv_atm = interp(&smile, 0.5);
+        let iv_25c = interp(&smile, 0.25);
+        if iv_atm > 0.0 && iv_25c > 0.0 {
+            out.push(VixSkewPt { date, ratio: iv_25c / iv_atm, iv_atm, iv_25c, spot });
+        }
+    }
+    out
+}
+
+#[derive(Serialize)]
+struct VixGammaPt {
+    date: String,
+    total: f64, // net dealer gamma imbalance ($mm, signed) — cm4 top
+    call: f64,  // signed dealer call gamma ($mm; dealers short VIX calls ⇒ negative) — cm4 bottom
+    spot: f64,
+}
+
+/// cm4: VIX dealer total gamma imbalance + call gamma, from the forward gamma_VIX.csv series.
+fn read_vix_gamma() -> Vec<VixGammaPt> {
+    let mut out = Vec::new();
+    if let Ok(t) = std::fs::read_to_string("data/gamma_VIX.csv") {
+        for line in t.lines().skip(1) {
+            let f: Vec<&str> = line.trim().split(',').collect();
+            if f.len() < 5 {
+                continue;
+            }
+            // date,spot,call_gex_mm,put_gex_mm,net_gex_mm,...
+            let p = |i: usize| f[i].trim().parse::<f64>().unwrap_or(f64::NAN);
+            out.push(VixGammaPt { date: f[0].to_string(), total: p(4), call: -p(2), spot: p(1) });
+        }
+    }
+    out
+}
+
+// ---- (1) Credit spreads (cross-asset leading indicator, FRED) ----
+
+#[derive(Serialize)]
+struct CreditPt {
+    date: String,
+    hy: f64,       // ICE BofA US High Yield OAS (%)
+    ig: f64,       // ICE BofA US IG OAS (%)
+    hy_chg20: f64, // 20-business-day change in HY OAS (widening rate = stress building)
+    close: f64,    // SPX (for the lead-vs-equity overlay)
+}
+
+/// HY/IG credit spreads (cached FRED series) joined with SPX close. Credit tends to
+/// crack before equities, so the 20-day widening rate is the leading signal here.
+fn read_credit() -> Vec<CreditPt> {
+    let hy = fred::load("credit_hy");
+    if hy.is_empty() {
+        return Vec::new();
+    }
+    let ig: BTreeMap<String, f64> = fred::load("credit_ig").into_iter().collect();
+    let spx: BTreeMap<String, f64> = read_dix().into_iter().map(|p| (p.date, p.price)).collect();
+    let hyv: Vec<f64> = hy.iter().map(|(_, v)| *v).collect();
+    let mut out = Vec::with_capacity(hy.len());
+    for (i, (d, v)) in hy.iter().enumerate() {
+        out.push(CreditPt {
+            date: d.clone(),
+            hy: *v,
+            ig: ig.get(d).copied().unwrap_or(f64::NAN),
+            hy_chg20: if i >= 20 { v - hyv[i - 20] } else { f64::NAN },
+            close: spx.get(d).copied().unwrap_or(f64::NAN),
+        });
+    }
+    out
+}
+
+// ---- (2) DIX / GEX regime (SqueezeMetrics DIX.csv, 2011→now) ----
 
 fn snap_dates(und: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -468,7 +698,7 @@ fn build_gamma(und: &str, date: &str) -> Option<GammaProfile> {
 
 fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) {
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-cache, no-store, must-revalidate\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
@@ -493,12 +723,26 @@ fn handle(mut stream: TcpStream, ohlc: &str, dates_json: &str, symbol: &str) {
     };
     match route {
         "/" | "/candles" => respond(&mut stream, "200 OK", "text/html; charset=utf-8", page(CANDLE_HTML).as_bytes()),
+        "/vix" => respond(&mut stream, "200 OK", "text/html; charset=utf-8", page(VIX_HTML).as_bytes()),
+        "/credit" => respond(&mut stream, "200 OK", "text/html; charset=utf-8", page(CREDIT_HTML).as_bytes()),
         "/surface" => respond(&mut stream, "200 OK", "text/html; charset=utf-8", page(SURFACE_HTML).as_bytes()),
         "/gamma" => respond(&mut stream, "200 OK", "text/html; charset=utf-8", page(GAMMA_HTML).as_bytes()),
         "/gex" => respond(&mut stream, "200 OK", "text/html; charset=utf-8", page(GEX_HTML).as_bytes()),
         "/gexplus" => respond(&mut stream, "200 OK", "text/html; charset=utf-8", page(GEXPLUS_HTML).as_bytes()),
         "/api/ohlc" => respond(&mut stream, "200 OK", "application/json", ohlc.as_bytes()),
         "/api/dates" => respond(&mut stream, "200 OK", "application/json", dates_json.as_bytes()),
+        "/api/vix_skew" => {
+            let body = serde_json::to_string(&build_vix_call_skew()).unwrap_or_else(|_| "[]".into());
+            respond(&mut stream, "200 OK", "application/json", body.as_bytes());
+        }
+        "/api/vix_gamma" => {
+            let body = serde_json::to_string(&read_vix_gamma()).unwrap_or_else(|_| "[]".into());
+            respond(&mut stream, "200 OK", "application/json", body.as_bytes());
+        }
+        "/api/credit" => {
+            let body = serde_json::to_string(&read_credit()).unwrap_or_else(|_| "[]".into());
+            respond(&mut stream, "200 OK", "application/json", body.as_bytes());
+        }
         "/api/surface" => {
             let body = serde_json::to_string(&build_surface(symbol, q("date"))).unwrap_or_else(|_| "{}".into());
             respond(&mut stream, "200 OK", "application/json", body.as_bytes());
@@ -527,16 +771,11 @@ fn handle(mut stream: TcpStream, ohlc: &str, dates_json: &str, symbol: &str) {
 }
 
 pub fn run(symbol: &str) {
-    // incremental update on startup: price gap-fill + today's CBOE snapshot + dealer gamma
-    println!("== data update ==");
-    match price::update_ohlc(Path::new(&fetch::default_cache_root())) {
-        Ok((n, last)) => println!("  price: {n} bars, last {last}"),
-        Err(e) => eprintln!("  price: {e}"),
-    }
-    crate::cboe::update_all();
-
+    // Serve reads committed/cached data ONLY — no network fetch at startup (no Yahoo).
+    // The daily GitHub Action keeps data/ current; run `skew update` or `git pull` to
+    // refresh locally. This keeps the dashboard from blocking on any data source.
     let ohlc = match build_ohlc(symbol) {
-        Ok(o) => o,
+        Ok(v) => v,
         Err(e) => {
             eprintln!("{e}\n(run `skew backfill {symbol}` first)");
             return;
@@ -566,7 +805,7 @@ pub fn run(symbol: &str) {
 }
 
 const NAV: &str = r#"<header><h1>Skew Analytics</h1>
-<nav><a href="/candles" id="nav-c">Candles</a><a href="/surface" id="nav-s">Vol Surface</a><a href="/gamma" id="nav-g">Dealer Gamma</a><a href="/gex" id="nav-x">Net GEX</a><a href="/gexplus" id="nav-p">GEX+</a></nav></header>"#;
+<nav><a href="/candles" id="nav-c">Candles</a><a href="/credit" id="nav-r">Credit</a><a href="/vix" id="nav-v">VIX</a><a href="/surface" id="nav-s">Vol Surface</a><a href="/gamma" id="nav-g">Dealer Gamma</a><a href="/gex" id="nav-x">Net GEX</a><a href="/gexplus" id="nav-p">GEX+</a></nav></header>"#;
 
 const STYLE: &str = r#"
   :root{--bg:#06080d;--panel:#0d1420;--line:#1c2738;--txt:#cdd6e5;--dim:#7c8aa0;--accent:#5ccfe6}
@@ -586,21 +825,31 @@ const CANDLE_HTML: &str = r###"<!DOCTYPE html><html lang="en"><head><meta charse
 <style>__STYLE__
   .wrap{padding:0}
   .sub{padding:8px 20px}
-  #candle{height:calc(100vh - 190px);width:100%} .chartwrap{position:relative}
+  #candle{height:calc(100vh - 226px);width:100%} .chartwrap{position:relative}
+  .tgbar{gap:14px;padding-top:0;flex-wrap:wrap} .tgbar label{display:flex;align-items:center;gap:5px;cursor:pointer;color:var(--txt)} .tgbar input{accent-color:var(--accent)}
   #legend{position:absolute;left:16px;top:10px;z-index:5;font-size:12.5px;background:#0b1220e6;border:1px solid var(--line);border-radius:7px;padding:7px 12px;opacity:0;pointer-events:none;white-space:nowrap}
   .ctrlbar{display:flex;gap:20px;align-items:center;padding:11px 20px;font-size:12.5px;color:var(--dim)}
   .ctrlbar input[type=number]{background:#0b1220;color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:4px 8px;width:60px;font-size:13px}
   .leg{display:flex;align-items:center;gap:6px}
   .dot{display:inline-block;width:9px;height:9px;border-radius:50%}
   .dot.red{background:#ff1744;box-shadow:0 0 6px #ff1744} .dot.green{background:#26ff8a;box-shadow:0 0 6px #26ff8a}
+  .dot.orange{background:#ff9800;box-shadow:0 0 6px #ff9800} .dot.teal{background:#14b8a6;box-shadow:0 0 6px #14b8a6}
   .ma-swatch{display:inline-block;width:16px;height:2px;background:#4fc3f7;vertical-align:middle}
 </style></head><body>__NAV__
 <div class="wrap">
   <div class="ctrlbar">
     <span class="leg"><span class="ma-swatch"></span>MA <input type="number" id="maPeriod" value="100" min="2" max="400" step="1"> d</span>
-    <span class="leg"><span class="dot red"></span>spot↑vol↑ lookback <input type="number" id="suvuLb" value="5" min="1" max="60" step="1"> d</span>
-    <span class="leg"><span class="dot green"></span>TS invert · fire&gt;<input type="number" id="tsUp" value="1.05" min="1" max="1.5" step="0.01"> rearm&lt;<input type="number" id="tsLo" value="1.00" min="0.8" max="1.2" step="0.01"></span>
-    <span style="margin-left:auto">middle = 25Δ skew %ile · bottom = ATM IV %ile · hover for values</span>
+    <span class="leg"><span class="dot red"></span>spot↑vol↑ lookback <input type="number" id="suvuLb" value="1" min="1" max="60" step="1"> d</span>
+    <span style="margin-left:auto">25Δ skew %ile · ATM IV %ile (daily SPX snapshots) · hover for values</span>
+  </div>
+  <div class="ctrlbar tgbar">
+    <span>show:</span>
+    <label><input type="checkbox" id="tgMA" checked> MA</label>
+    <label><input type="checkbox" id="tgSkew" checked> 25Δ skew %ile</label>
+    <label><input type="checkbox" id="tgIV" checked> ATM IV %ile</label>
+    <label><input type="checkbox" id="tgSuvu" checked> spot↑vol↑</label>
+    <label><input type="checkbox" id="tgTop" checked> <span class="dot orange"></span> top 고점</label>
+    <label><input type="checkbox" id="tgBot" checked> <span class="dot teal"></span> bottom 저점</label>
   </div>
   <div class="chartwrap"><div id="legend"></div><div id="candle"></div></div>
 </div>
@@ -627,21 +876,34 @@ document.getElementById('nav-c').classList.add('active');
   skew.setData(bars.filter(b=>b.skew_pct!=null).map(b=>({time:b.date,value:b.skew_pct})));
   const ivS=chart.addSeries(LC.LineSeries,{color:'#ffb454',lineWidth:1,priceLineVisible:false,lastValueVisible:false},2);
   ivS.setData(bars.filter(b=>b.iv_pct!=null).map(b=>({time:b.date,value:b.iv_pct})));
-  try{const p=chart.panes();if(p[0])p[0].setHeight(380);if(p[1])p[1].setHeight(110);if(p[2])p[2].setHeight(110);}catch(e){}
+  try{const p=chart.panes();if(p[0])p[0].setHeight(400);if(p[1])p[1].setHeight(120);if(p[2])p[2].setHeight(120);}catch(e){}
   // red: spot-up & vol-up over an adjustable lookback (close[i]>close[i-lb] AND IV[i]>IV[i-lb])
   function redMarkers(lb){const o=[];for(let i=lb;i<bars.length;i++){const a=bars[i],p=bars[i-lb];if(a.iv!=null&&p.iv!=null&&a.c>p.c&&a.iv>p.iv)o.push({time:a.date,position:'aboveBar',color:'#ff1744',shape:'circle'});}return o;}
-  // green: term-structure inversion ONSET via hysteresis — fire when ts_ratio crosses above `up`,
-  // re-arm only after it falls below `lo` (so each inversion episode flags exactly once, at its start)
-  function greenMarkers(up,lo){const o=[];let inv=false;for(let i=0;i<bars.length;i++){const r=bars[i].tsr;if(r==null)continue;if(!inv&&r>up){o.push({time:bars[i].date,position:'aboveBar',color:'#26ff8a',shape:'circle'});inv=true;}else if(inv&&r<lo){inv=false;}}return o;}
+  // ML turning-point signals: top (고점) orange above bar, bottom (저점) teal below bar
+  function topMarkers(){return bars.filter(b=>b.top).map(b=>({time:b.date,position:'aboveBar',color:'#ff9800',shape:'circle',size:2}));}
+  function botMarkers(){return bars.filter(b=>b.bot).map(b=>({time:b.date,position:'belowBar',color:'#14b8a6',shape:'circle',size:2}));}
   const markersPrim=LC.createSeriesMarkers(candle,[]);
-  const suvuInput=document.getElementById('suvuLb'),upInput=document.getElementById('tsUp'),loInput=document.getElementById('tsLo');
+  const suvuInput=document.getElementById('suvuLb');
+  const isOn=id=>{const el=document.getElementById(id);return !el||el.checked;};
   function refreshMarkers(){
-    const lb=Math.max(1,Math.min(60,+suvuInput.value||5));
-    const up=+upInput.value||1.05, lo=+loInput.value||1.0;
-    const all=redMarkers(lb).concat(greenMarkers(up,lo)).sort((a,b)=> a.time<b.time?-1 : a.time>b.time?1 : (a.color==='#ff1744'?-1:1));
+    const lb=Math.max(1,Math.min(60,+suvuInput.value||1));
+    let all=[];
+    if(isOn('tgSuvu')) all=all.concat(redMarkers(lb));
+    if(isOn('tgTop')) all=all.concat(topMarkers());
+    if(isOn('tgBot')) all=all.concat(botMarkers());
+    all.sort((a,b)=> a.time<b.time?-1 : a.time>b.time?1 : 0);
     markersPrim.setMarkers(all);
   }
-  refreshMarkers();[suvuInput,upInput,loInput].forEach(el=>el.addEventListener('input',refreshMarkers));
+  refreshMarkers();
+  suvuInput.addEventListener('input',refreshMarkers);
+  // indicator on/off toggles
+  const bind=(id,fn)=>{const e=document.getElementById(id); if(e) e.addEventListener('change',()=>fn(e.checked));};
+  bind('tgMA',v=>maSeries.applyOptions({visible:v}));
+  bind('tgSkew',v=>skew.applyOptions({visible:v}));
+  bind('tgIV',v=>ivS.applyOptions({visible:v}));
+  bind('tgSuvu',()=>refreshMarkers());
+  bind('tgTop',()=>refreshMarkers());
+  bind('tgBot',()=>refreshMarkers());
   chart.timeScale().fitContent();
 
   const legend=document.getElementById('legend');
@@ -949,3 +1211,115 @@ window.addEventListener('resize',()=>chart.resize());
   });
 })();
 </script></body></html>"###;
+
+const VIX_HTML: &str = r###"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Skew Analytics — VIX</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>__STYLE__
+  .wrap{padding:0}
+  .sub{padding:10px 20px;font-size:12.5px;color:var(--dim)}
+  #vx{height:calc(100vh - 130px);width:100%}
+</style></head><body>__NAV__
+<div class="wrap">
+  <div class="sub"><b style="color:var(--txt)">VIX vol-of-vol (Nomura / McElligott style)</b> — forward series from our CBOE VIX snapshots (grows daily). Top: <span style="color:#e34a4a">3M call skew 25dC/ATM</span> (cm3). Middle/bottom: VIX dealer <span style="color:#cdd6e5">total gamma imbalance</span> & <span style="color:#cdd6e5">call gamma</span> (cm4). · <span id="info"></span></div>
+  <div id="vx"></div>
+</div>
+<script>
+document.getElementById('nav-v').classList.add('active');
+const AX={axisLine:{lineStyle:{color:'#33415a'}},axisLabel:{color:'#8595ad'},nameTextStyle:{color:'#8595ad'}};
+const chart=echarts.init(document.getElementById('vx'),null,{renderer:'canvas'});
+window.addEventListener('resize',()=>chart.resize());
+(async function(){
+  const [sk,gm]=await Promise.all([
+    (await fetch('/api/vix_skew')).json(),
+    (await fetch('/api/vix_gamma')).json()
+  ]);
+  const dset=new Set([...sk.map(p=>p.date),...gm.map(p=>p.date)]);
+  const xs=[...dset].sort();
+  const mapv=(arr,key)=>{const m=new Map(arr.map(p=>[p.date,p[key]]));return xs.map(x=>m.has(x)?+(+m.get(x)).toFixed(4):null);};
+  const ratio=mapv(sk,'ratio'), total=mapv(gm,'total'), call=mapv(gm,'call');
+  const ls=sk[sk.length-1], lg=gm[gm.length-1];
+  document.getElementById('info').textContent=
+    `${xs.length} day(s)`+(sk.length?` · 3M call skew ${ls.ratio.toFixed(3)}`:' · no VIX snapshots')+
+    (gm.length?` · total γ ${lg.total.toFixed(1)} · call γ ${lg.call.toFixed(1)} $mm`:'');
+  const G={left:80,right:28};
+  const ln=(name,data,color,i)=>({name,type:'line',data,xAxisIndex:i,yAxisIndex:i,showSymbol:true,symbolSize:5,connectNulls:true,lineStyle:{color,width:1.5},itemStyle:{color}});
+  const zero={markLine:{symbol:'none',silent:true,data:[{yAxis:0,lineStyle:{color:'#445268',type:'dashed',width:1}}]}};
+  chart.setOption({
+    backgroundColor:'transparent',
+    tooltip:{trigger:'axis',backgroundColor:'#0b1220',borderColor:'#1c2738',textStyle:{color:'#cdd6e5'}},
+    axisPointer:{link:[{xAxisIndex:'all'}]},
+    grid:[
+      Object.assign({top:'6%',height:'23%'},G),
+      Object.assign({top:'39%',height:'23%'},G),
+      Object.assign({top:'71%',height:'23%'},G)
+    ],
+    xAxis:[
+      Object.assign({type:'category',data:xs,gridIndex:0,boundaryGap:false,axisLabel:{show:false}},AX),
+      Object.assign({type:'category',data:xs,gridIndex:1,boundaryGap:false,axisLabel:{show:false}},AX),
+      Object.assign({type:'category',data:xs,gridIndex:2,boundaryGap:false},AX)
+    ],
+    yAxis:[
+      Object.assign({type:'value',name:'3M 25dC/ATM',gridIndex:0,scale:true,splitLine:{lineStyle:{color:'#141d2b'}}},AX),
+      Object.assign({type:'value',name:'Total γ imb. $mm',gridIndex:1,splitLine:{lineStyle:{color:'#141d2b'}}},AX),
+      Object.assign({type:'value',name:'Call γ $mm',gridIndex:2,splitLine:{lineStyle:{color:'#141d2b'}}},AX)
+    ],
+    dataZoom:[{type:'inside',xAxisIndex:[0,1,2]},{type:'slider',xAxisIndex:[0,1,2],height:16,bottom:6,borderColor:'#1c2738',textStyle:{color:'#8595ad'}}],
+    series:[
+      ln('VIX 3M Call Skew (25dC/ATM)',ratio,'#e34a4a',0),
+      Object.assign(ln('VIX Dealer Total Gamma Imbalance',total,'#9aa6ba',1),zero),
+      Object.assign(ln('VIX Call Gamma',call,'#9aa6ba',2),zero)
+    ]
+  });
+})();
+</script></body></html>"###;
+
+const CREDIT_HTML: &str = r###"<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Skew Analytics — Credit</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>__STYLE__
+  .wrap{padding:0}
+  .sub{padding:10px 20px;font-size:12.5px;color:var(--dim)}
+  #cr{height:calc(100vh - 130px);width:100%}
+</style></head><body>__NAV__
+<div class="wrap">
+  <div class="sub"><b style="color:var(--txt)">Credit Spreads — leading cross-asset signal</b> · <span style="color:#e34a4a">HY OAS %</span> · <span style="color:#9aa6ba">IG OAS %</span> · grey = SPX (log). Bottom: HY 20-day widening rate (&gt;0 = stress building, tends to lead equity drawdowns). · <span id="info"></span></div>
+  <div id="cr"></div>
+</div>
+<script>
+document.getElementById('nav-r').classList.add('active');
+const AX={axisLine:{lineStyle:{color:'#33415a'}},axisLabel:{color:'#8595ad'},nameTextStyle:{color:'#8595ad'}};
+const chart=echarts.init(document.getElementById('cr'),null,{renderer:'canvas'});
+window.addEventListener('resize',()=>chart.resize());
+(async function(){
+  const d=await (await fetch('/api/credit')).json();
+  if(!d.length){document.getElementById('info').textContent='no FRED credit data — run `skew update` (needs network)';return;}
+  const xs=d.map(p=>p.date), last=d[d.length-1];
+  document.getElementById('info').textContent=`${d.length} days · latest HY OAS ${last.hy.toFixed(2)}% · 20d chg ${(last.hy_chg20>=0?'+':'')+last.hy_chg20.toFixed(2)}`;
+  const G={left:64,right:64};
+  chart.setOption({
+    backgroundColor:'transparent',
+    legend:{data:['HY OAS','IG OAS','SPX'],textStyle:{color:'#aeb6c4'},top:6},
+    tooltip:{trigger:'axis',backgroundColor:'#0b1220',borderColor:'#1c2738',textStyle:{color:'#cdd6e5'}},
+    axisPointer:{link:[{xAxisIndex:'all'}]},
+    grid:[Object.assign({top:'9%',height:'55%'},G),Object.assign({top:'73%',height:'19%'},G)],
+    xAxis:[
+      Object.assign({type:'category',data:xs,gridIndex:0,boundaryGap:false,axisLabel:{show:false}},AX),
+      Object.assign({type:'category',data:xs,gridIndex:1,boundaryGap:false},AX)
+    ],
+    yAxis:[
+      Object.assign({type:'value',name:'OAS %',gridIndex:0,scale:true,splitLine:{lineStyle:{color:'#141d2b'}}},AX),
+      Object.assign({type:'log',name:'SPX',gridIndex:0,position:'right',splitLine:{show:false}},AX),
+      Object.assign({type:'value',name:'HY 20d Δ',gridIndex:1,splitLine:{lineStyle:{color:'#141d2b'}}},AX)
+    ],
+    dataZoom:[{type:'inside',xAxisIndex:[0,1]},{type:'slider',xAxisIndex:[0,1],height:16,bottom:6,borderColor:'#1c2738',textStyle:{color:'#8595ad'}}],
+    series:[
+      {name:'HY OAS',type:'line',xAxisIndex:0,yAxisIndex:0,data:d.map(p=>p.hy),showSymbol:false,sampling:'lttb',lineStyle:{color:'#e34a4a',width:1.4},areaStyle:{color:'rgba(227,74,74,0.08)'}},
+      {name:'IG OAS',type:'line',xAxisIndex:0,yAxisIndex:0,data:d.map(p=>p.ig),showSymbol:false,sampling:'lttb',lineStyle:{color:'#9aa6ba',width:1}},
+      {name:'SPX',type:'line',xAxisIndex:0,yAxisIndex:1,data:d.map(p=>p.close),showSymbol:false,sampling:'lttb',lineStyle:{color:'#5b6678',width:1},z:1},
+      {name:'HY 20d Δ',type:'line',xAxisIndex:1,yAxisIndex:2,data:d.map(p=>p.hy_chg20==null?null:+p.hy_chg20.toFixed(3)),showSymbol:false,sampling:'lttb',lineStyle:{color:'#ffb454',width:1},areaStyle:{color:'rgba(255,180,84,0.10)'},markLine:{symbol:'none',silent:true,data:[{yAxis:0,lineStyle:{color:'#445268',type:'dashed',width:1}}]}}
+    ]
+  });
+})();
+</script></body></html>"###;
+

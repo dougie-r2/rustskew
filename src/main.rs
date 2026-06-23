@@ -5,9 +5,11 @@ mod chart;
 mod hedge;
 mod dates;
 mod fetch;
+mod fred;
 mod price;
 mod serve;
 mod skew;
+mod svi;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -47,6 +49,7 @@ fn run_update() {
         Err(e) => eprintln!("  price: {e}"),
     }
     cboe::update_all();
+    fred::update_all();
 }
 
 #[derive(Clone)]

@@ -15,3 +15,20 @@
 *.PNG
 *.png
 cm_yt*.txt
+
+# python caches + CatBoost training artifacts
+__pycache__/
+*.pyc
+/catboost_info/
+
+# regenerable ML outputs (rebuilt by the pipeline each run; CI commits only data/)
+/ml/features.csv
+/ml/features_long*.csv
+/ml/oos_probs.csv
+/ml/oos_pred*.csv
+/ml/raw/
+
+# BTC sub-project — separate effort, not part of the SPX CI pipeline
+/ml/btc_*
+/data/btc_*
+/data/signals_btc.csv

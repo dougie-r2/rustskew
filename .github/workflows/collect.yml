@@ -36,14 +36,27 @@ jobs:
       - name: Update data (price + CBOE snapshot + dealer gamma)
         run: ./target/release/skew update
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Refresh model inputs (FRED + CBOE indices + DIX)
+        run: uv run --quiet python ml/fetch_data.py
+
+      - name: Rebuild features + turning-point signals
+        run: |
+          PROD=1 uv run --quiet --with pyswisseph --with pywavelets --with hmmlearn \
+            --with pandas --with numpy python ml/build_features.py
+          uv run --quiet --with catboost --with scikit-learn --with pandas --with numpy \
+            python ml/gen_signals.py
+
       - name: Commit new data
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A data
+          git add -A data DIX.csv
           if git diff --cached --quiet; then
             echo "no new data (non-trading day or already collected)"
           else
-            git commit -m "data: $(date -u +%F) snapshot"
+            git commit -m "data: $(date -u +%F) snapshot + signals"
             git push
           fi
