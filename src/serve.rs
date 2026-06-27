@@ -11,12 +11,13 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::{bs, dates, fetch, fred, price, svi};
+use crate::{bs, fetch, fred, price, svi};
 
 const NX: usize = 40; // moneyness grid points
 const NY: usize = 30; // dte grid points
 const MNY0: f64 = 0.80;
 const MNY1: f64 = 1.20;
+const MAX_DTE: i64 = 180; // surface term-structure horizon (days); drops multi-year LEAPS
 const PCT_WIN: usize = 252;
 
 #[derive(Serialize)]
@@ -230,24 +231,6 @@ fn build_ohlc(symbol: &str) -> Result<Vec<Ohlc>, String> {
     Ok(out)
 }
 
-fn list_chain_dates(symbol: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(format!("data/dolt/{symbol}")) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("json")
-                && e.metadata().map(|m| m.len() > 2).unwrap_or(false)
-            {
-                if let Some(s) = p.file_stem().and_then(|x| x.to_str()) {
-                    out.push(s.to_string());
-                }
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
 fn interp(samples: &[(f64, f64)], x: f64) -> f64 {
     if samples.is_empty() {
         return f64::NAN;
@@ -268,48 +251,58 @@ fn interp(samples: &[(f64, f64)], x: f64) -> f64 {
     samples[samples.len() - 1].1
 }
 
-/// Build a Moneyness × Expiration IV surface (OTM blend: OTM puts below spot,
-/// OTM calls above). Spot is estimated from the front expiry's 50Δ strike.
-fn build_surface(symbol: &str, date: &str) -> Surface {
-    let mut empty = Surface { date: date.to_string(), moneyness: vec![], dtes: vec![], z: vec![] };
-    let path = format!("data/dolt/{symbol}/{date}.json");
-    let Ok(bytes) = std::fs::read(&path) else { return empty };
-    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return empty };
-    let Some(arr) = val.as_array() else { return empty };
-    let Some(d0) = dates::parse_ymd(date) else { return empty };
+/// Per-expiry option quotes: dte -> (strike, delta, iv, is_put).
+type Smile = BTreeMap<i64, Vec<(f64, f64, f64, bool)>>;
 
-    // per-expiry quotes: (strike, delta, iv, is_put)
-    let mut by: BTreeMap<i64, Vec<(f64, f64, f64, bool)>> = BTreeMap::new();
-    for row in arr {
-        let cp = row.get("call_put").and_then(|x| x.as_str()).unwrap_or("");
-        let put = cp.eq_ignore_ascii_case("Put");
-        let call = cp.eq_ignore_ascii_case("Call");
-        if !put && !call {
+/// Live SPX option smile from a stored daily CBOE snapshot CSV
+/// (strike,dte,cp,oi,gamma,delta,iv,...; spot from the `# spot,` header).
+fn snap_smile(date: &str) -> Option<(Smile, f64)> {
+    let text = std::fs::read_to_string(format!("data/snap/SPX/{date}.csv")).ok()?;
+    let mut spot = f64::NAN;
+    let mut by: Smile = BTreeMap::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("# spot,") {
+            spot = rest.split(',').next().and_then(|x| x.parse().ok()).unwrap_or(f64::NAN);
             continue;
         }
-        let pf = |k: &str| row.get(k).and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok());
-        let exp = row.get("expiration").and_then(|x| x.as_str()).and_then(dates::parse_ymd);
-        if let (Some(iv), Some(d), Some(k), Some(e)) = (pf("vol"), pf("delta"), pf("strike"), exp) {
-            let dte = e - d0;
-            if iv > 0.01 && iv < 2.5 && d.abs() >= 0.02 && d.abs() <= 0.98 && dte >= 3 && k > 0.0 {
-                by.entry(dte).or_default().push((k, d, iv, put));
-            }
+        if line.starts_with("strike") {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        if f.len() < 7 {
+            continue;
+        }
+        let put = f[2].eq_ignore_ascii_case("P");
+        if !put && !f[2].eq_ignore_ascii_case("C") {
+            continue;
+        }
+        let (Ok(k), Ok(dte), Ok(d), Ok(iv)) =
+            (f[0].parse::<f64>(), f[1].parse::<f64>(), f[5].parse::<f64>(), f[6].parse::<f64>())
+        else {
+            continue;
+        };
+        let dte = dte.round() as i64;
+        if iv > 0.01 && iv < 2.5 && d.abs() >= 0.02 && d.abs() <= 0.98 && (3..=MAX_DTE).contains(&dte)
+            && k > 0.0
+        {
+            by.entry(dte).or_default().push((k, d, iv, put));
         }
     }
+    if !spot.is_finite() || spot <= 0.0 || by.len() < 2 {
+        return None;
+    }
+    Some((by, spot))
+}
+
+/// Build a Moneyness × Expiration IV surface (OTM blend: OTM puts below spot,
+/// OTM calls above) from the live SPX CBOE snapshot.
+fn build_surface(_symbol: &str, date: &str) -> Surface {
+    let mut empty = Surface { date: date.to_string(), moneyness: vec![], dtes: vec![], z: vec![] };
+    let Some((by, spot)) = snap_smile(date) else {
+        return empty;
+    };
     let dtes_keys: Vec<i64> = by.keys().copied().collect();
     if dtes_keys.len() < 2 {
-        return empty;
-    }
-    // estimate spot from the front expiry's 50-delta put strike
-    let front = &by[&dtes_keys[0]];
-    let mut put_ds: Vec<(f64, f64)> = front
-        .iter()
-        .filter(|q| q.3)
-        .map(|q| (q.1, q.0))
-        .collect(); // (delta, strike)
-    put_ds.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-    let spot = interp(&put_ds, -0.5);
-    if !spot.is_finite() || spot <= 0.0 {
         return empty;
     }
 
@@ -783,7 +776,7 @@ pub fn run(symbol: &str) {
     };
     let n_sig = ohlc.iter().filter(|b| b.sig).count();
     let ohlc_json = Arc::new(serde_json::to_string(&ohlc).unwrap());
-    let chain_dates = list_chain_dates(symbol);
+    let chain_dates = snap_dates("SPX");
     let n_dates = chain_dates.len();
     let dates_json = Arc::new(serde_json::to_string(&chain_dates).unwrap());
     let symbol = Arc::new(symbol.to_string());
