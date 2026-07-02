@@ -49,6 +49,7 @@ fn run_update() {
         Err(e) => eprintln!("  price: {e}"),
     }
     cboe::update_all();
+    cboe::update_index_history();
     fred::update_all();
 }
 

@@ -42,6 +42,23 @@ struct Ohlc {
     sig: bool,
     top: bool, // ML top (고점) signal  — orange
     bot: bool, // ML bottom (저점) signal — teal
+    cz: bool,  // complacency zone (사전 경고): SPX 252d %ile>=95 & VIX<=15.5 & COR1M<=9
+}
+
+/// Load a date,value CSV cached by `skew update` (data/cboe_<name>.csv).
+fn load_idx(name: &str) -> std::collections::BTreeMap<String, f64> {
+    let mut m = std::collections::BTreeMap::new();
+    if let Ok(t) = std::fs::read_to_string(format!("data/cboe_{name}.csv")) {
+        for line in t.lines().skip(1) {
+            let mut it = line.split(',');
+            if let (Some(d), Some(v)) = (it.next(), it.next()) {
+                if let Ok(val) = v.trim().parse::<f64>() {
+                    m.insert(d.trim().to_string(), val);
+                }
+            }
+        }
+    }
+    m
 }
 
 /// Load the ML turning-point signals (data/signals.csv: date,top,bottom).
@@ -213,19 +230,44 @@ fn build_ohlc(symbol: &str) -> Result<Vec<Ohlc>, String> {
     let ivp = rolling_pct(&ivff, PCT_WIN);
     let lb = 1;
     let signals = load_signals();
+    // Complacency zone (사전 경고, validated in ml/complacency_top.py): SPX at >=95th %ile
+    // of the trailing 252 closes AND VIX<=15.5 AND COR1M<=9 — euphoria/dispersion extreme.
+    // ~1.7x lift for a -4% pullback within 40-60d; it is a fragility zone, NOT a 20d trigger.
+    let vixh = load_idx("vix");
+    let corh = load_idx("cor1m");
+    let closes: Vec<f64> = bars.iter().map(|b| b.4).collect();
+    let mut czv = vec![false; n];
+    let (mut vix_ff, mut cor_ff) = (f64::NAN, f64::NAN);
+    let (mut vi, mut ci) = (vixh.iter().peekable(), corh.iter().peekable());
+    for i in 0..n {
+        while let Some((d, v)) = vi.peek() {
+            if d.as_str() <= bars[i].0.as_str() { vix_ff = **v; vi.next(); } else { break }
+        }
+        while let Some((d, v)) = ci.peek() {
+            if d.as_str() <= bars[i].0.as_str() { cor_ff = **v; ci.next(); } else { break }
+        }
+        if i >= 251 && vix_ff <= 15.5 && cor_ff <= 9.0 {
+            let pct = closes[i - 251..i].iter().filter(|&&x| x <= closes[i]).count() as f64 / 251.0;
+            czv[i] = pct >= 0.95;
+        }
+    }
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let b = &bars[i];
         // default spot-up-vol-up (1d); the browser recomputes at any lookback from `iv`.
+        // Matches the browser's redMarkers: also require an UP candle (c>o) whose close is a
+        // 5-day high (no higher close in the prior 5 bars).
         let sig = i >= lb
             && ivff[i].is_finite()
             && ivff[i - lb].is_finite()
             && b.4 > bars[i - lb].4
-            && ivff[i] > ivff[i - lb];
+            && ivff[i] > ivff[i - lb]
+            && b.4 > b.1
+            && (i.saturating_sub(5)..i).all(|k| bars[k].4 <= b.4);
         let (top, bot) = signals.get(&b.0).copied().unwrap_or((false, false));
         out.push(Ohlc {
             date: b.0.clone(), o: b.1, h: b.2, l: b.3, c: b.4,
-            skew_pct: skp[i], iv_pct: ivp[i], iv: ivff[i], sig, top, bot,
+            skew_pct: skp[i], iv_pct: ivp[i], iv: ivff[i], sig, top, bot, cz: czv[i],
         });
     }
     Ok(out)
@@ -790,7 +832,9 @@ pub fn run(symbol: &str) {
         }
     };
     println!("skew analytics  ->  http://{addr}/candles   and   http://{addr}/surface");
-    println!("  {} daily bars, {} spot-up-vol-up signals, {} surface dates", ohlc.len(), n_sig, n_dates);
+    let n_cz = ohlc.iter().filter(|b| b.cz).count();
+    println!("  {} daily bars, {} spot-up-vol-up signals, {} complacency-zone days, {} surface dates",
+        ohlc.len(), n_sig, n_cz, n_dates);
     for stream in listener.incoming().flatten() {
         let (o, d, s) = (Arc::clone(&ohlc_json), Arc::clone(&dates_json), Arc::clone(&symbol));
         std::thread::spawn(move || handle(stream, &o, &d, &s));
@@ -843,6 +887,7 @@ const CANDLE_HTML: &str = r###"<!DOCTYPE html><html lang="en"><head><meta charse
     <label><input type="checkbox" id="tgSuvu" checked> spot↑vol↑</label>
     <label><input type="checkbox" id="tgTop" checked> <span class="dot orange"></span> top 고점</label>
     <label><input type="checkbox" id="tgBot" checked> <span class="dot teal"></span> bottom 저점</label>
+    <label title="SPX 252d %ile>=95 & VIX<=15.5 & COR1M<=9 — 안일함 극단, 1~3개월 내 -4% 조정 확률 ~1.7x (사전 경고 존)"><input type="checkbox" id="tgCz" checked> ⚠ complacency</label>
   </div>
   <div class="chartwrap"><div id="legend"></div><div id="candle"></div></div>
 </div>
@@ -857,6 +902,11 @@ document.getElementById('nav-c').classList.add('active');
     grid:{vertLines:{color:'#101826'},horzLines:{color:'#101826'}},
     rightPriceScale:{borderColor:'#1c2738'},timeScale:{borderColor:'#1c2738'},
     crosshair:{mode:LC.CrosshairMode.Normal,vertLine:{color:'#3a4a63',labelBackgroundColor:'#1c2738'},horzLine:{color:'#3a4a63',labelBackgroundColor:'#1c2738'}}});
+  // complacency zone — full-height yellow band behind the candles (added FIRST = drawn under).
+  // Server-computed (cz): SPX 252d %ile>=95 & VIX<=15.5 & COR1M<=9 -> 1-3mo pullback fragility.
+  const czSeries=chart.addSeries(LC.HistogramSeries,{color:'rgba(255,193,7,0.16)',priceScaleId:'cz',priceLineVisible:false,lastValueVisible:false},0);
+  czSeries.priceScale().applyOptions({scaleMargins:{top:0,bottom:0},visible:false});
+  czSeries.setData(bars.filter(b=>b.cz).map(b=>({time:b.date,value:1})));
   const candle=chart.addSeries(LC.CandlestickSeries,{upColor:'#26a69a',downColor:'#ef5350',wickUpColor:'#26a69a',wickDownColor:'#ef5350',borderUpColor:'#26a69a',borderDownColor:'#ef5350'},0);
   candle.setData(bars.map(b=>({time:b.date,open:b.o,high:b.h,low:b.l,close:b.c})));
   // moving-average overlay on the candle pane (adjustable period)
@@ -870,8 +920,9 @@ document.getElementById('nav-c').classList.add('active');
   const ivS=chart.addSeries(LC.LineSeries,{color:'#ffb454',lineWidth:1,priceLineVisible:false,lastValueVisible:false},2);
   ivS.setData(bars.filter(b=>b.iv_pct!=null).map(b=>({time:b.date,value:b.iv_pct})));
   try{const p=chart.panes();if(p[0])p[0].setHeight(400);if(p[1])p[1].setHeight(120);if(p[2])p[2].setHeight(120);}catch(e){}
-  // red: spot-up & vol-up over an adjustable lookback (close[i]>close[i-lb] AND IV[i]>IV[i-lb])
-  function redMarkers(lb){const o=[];for(let i=lb;i<bars.length;i++){const a=bars[i],p=bars[i-lb];if(a.iv!=null&&p.iv!=null&&a.c>p.c&&a.iv>p.iv)o.push({time:a.date,position:'aboveBar',color:'#ff1744',shape:'circle'});}return o;}
+  // red: spot-up & vol-up over an adjustable lookback (close[i]>close[i-lb] AND IV[i]>IV[i-lb]),
+  //      restricted to UP candles (c>o) whose close is a 5-day high (no higher close in the prior 5 bars)
+  function redMarkers(lb){const o=[];for(let i=lb;i<bars.length;i++){const a=bars[i],p=bars[i-lb];if(!(a.iv!=null&&p.iv!=null&&a.c>p.c&&a.iv>p.iv))continue;if(!(a.c>a.o))continue;let hi=false;for(let k=Math.max(0,i-5);k<i;k++){if(bars[k].c>a.c){hi=true;break;}}if(hi)continue;o.push({time:a.date,position:'aboveBar',color:'#ff1744',shape:'circle'});}return o;}
   // ML turning-point signals: top (고점) orange above bar, bottom (저점) teal below bar
   function topMarkers(){return bars.filter(b=>b.top).map(b=>({time:b.date,position:'aboveBar',color:'#ff9800',shape:'circle',size:2}));}
   function botMarkers(){return bars.filter(b=>b.bot).map(b=>({time:b.date,position:'belowBar',color:'#14b8a6',shape:'circle',size:2}));}
@@ -897,6 +948,7 @@ document.getElementById('nav-c').classList.add('active');
   bind('tgSuvu',()=>refreshMarkers());
   bind('tgTop',()=>refreshMarkers());
   bind('tgBot',()=>refreshMarkers());
+  bind('tgCz',v=>czSeries.applyOptions({visible:v}));
   chart.timeScale().fitContent();
 
   const legend=document.getElementById('legend');

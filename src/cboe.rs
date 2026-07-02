@@ -216,3 +216,40 @@ pub fn update_all() {
         }
     }
 }
+
+/// CBOE official index-history series (full history per fetch, so re-runs are idempotent)
+/// -> data/cboe_<name>.csv (date,value = close). Feeds the candles complacency zone.
+const INDEX_HIST: &[(&str, &str)] = &[("VIX_History", "vix"), ("COR1M_History", "cor1m")];
+
+pub fn update_index_history() {
+    for (fname, name) in INDEX_HIST {
+        let url = format!("https://cdn.cboe.com/api/global/us_indices/daily_prices/{fname}.csv");
+        match curl_get(&url) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let mut out = String::from("date,value\n");
+                let (mut rows, mut last) = (0usize, String::new());
+                for line in text.lines().skip(1) {
+                    // DATE,OPEN,HIGH,LOW,CLOSE with MM/DD/YYYY dates
+                    let mut it = line.split(',');
+                    let (Some(d), Some(close)) = (it.next(), it.nth(3)) else { continue };
+                    let p: Vec<&str> = d.trim().split('/').collect();
+                    if p.len() != 3 {
+                        continue;
+                    }
+                    let Ok(v) = close.trim().parse::<f64>() else { continue };
+                    last = format!("{}-{}-{}", p[2], p[0], p[1]);
+                    out.push_str(&format!("{last},{v}\n"));
+                    rows += 1;
+                }
+                if rows > 0 {
+                    let _ = std::fs::write(format!("data/cboe_{name}.csv"), out);
+                    println!("  cboe {name}: {rows} rows, last {last}");
+                } else {
+                    eprintln!("  cboe {name}: no rows parsed");
+                }
+            }
+            Err(e) => eprintln!("  cboe {name}: {e}"),
+        }
+    }
+}

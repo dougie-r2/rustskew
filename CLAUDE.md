@@ -65,6 +65,10 @@ Q=0.95 uv run --with pandas --with numpy python ml/reflag.py   # causal signals.
   from the dashboard — `build_surface` reads snapshots only via `snap_smile()` (no fallback),
   surface dte capped at 180d (drops multi-year LEAPS). Stale/non-auto pages were deleted;
   nav = Candles, Credit, VIX, Vol Surface, Dealer Gamma, Net GEX, GEX+.
+- Candles has a yellow **complacency zone** (사전 경고): SPX 252d %ile≥95 & VIX≤15.5 &
+  COR1M≤9. Validated in `ml/complacency_top.py`: ~1.7× lift for a −4% pullback within
+  40–60d (NOT a 20d timing trigger — 20d precision ≈ base). Inputs `data/cboe_vix.csv` /
+  `data/cboe_cor1m.csv` come from CBOE index history, refreshed daily by `skew update`.
 - Detailed results live in `docs/leading_indicator_results.md`, `docs/model_selection.md`,
   `docs/feature_checklist.md`.
 
