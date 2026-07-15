@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """Generate dashboard turning-point signals -> data/signals.csv (date,top,bottom).
 
-Walk-forward OOS probabilities (honest, no lookahead) for the chosen models:
-  TOP  = technical+physics+wavelet+hmm   (best top detector, ~AUC 0.67) -> orange
-  BOTTOM = everything except astrology    (best bottom detector, ~AUC 0.92) -> teal
-Flagging is CAUSAL (real-time usable): a day fires on the RISING EDGE — the first day its
-OOS prob crosses above an EXPANDING-WINDOW (past-only) quantile threshold; re-arms after the
-prob drops back below. No future data is ever used (matches ml/reflag.py).
+PUBLISHED SIGNALS ARE IMMUTABLE. The pipeline is append-only:
+
+  data/probs.csv    point-in-time OOS probabilities (date,top_prob,bottom_prob).
+                    Each daily run trains on data up to (today - EMBARGO) and predicts
+                    ONLY the new day(s), then appends. Rows, once written, never change.
+  data/signals.csv  pure function of the frozen prob history: rising-edge over an
+                    EXPANDING-WINDOW (past-only) quantile threshold, exactly flag().
+                    Because past probs are frozen, past flags can never repaint.
+
+Bootstrap: if data/probs.csv is missing, the full prob history is generated once with
+walk-forward CV (honest OOS, no lookahead) and frozen from then on. Deleting probs.csv
+forces a full rebuild — research only; it rewrites published history.
+
+Models: TOP = technical+physics+wavelet+hmm, BOTTOM = all PROD groups (see CLAUDE.md).
 """
 import os, sys
 import numpy as np
@@ -16,7 +24,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 from train import load, feat_cols, group_of
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROBS_PATH = os.path.join(ROOT, "data", "probs.csv")
+SIGNALS_PATH = os.path.join(ROOT, "data", "signals.csv")
 SEEDS = [7, 23, 101]
+EMBARGO = 5
 # production groups = only daily-auto-updatable sources (OHLC+FRED+CBOE+DIX);
 # astrology/seasonality/breadth excluded (non-predictive or no daily source).
 PROD_GROUPS = {"technical","physics","wavelet","hmm","vol","macro",
@@ -30,7 +41,7 @@ def cb(s):
         loss_function="Logloss", auto_class_weights="Balanced", random_seed=s,
         verbose=0, allow_writing_files=False)
 
-def wf(X, y, seed, n_splits=8, embargo=5, init_frac=0.25):
+def wf(X, y, seed, n_splits=8, embargo=EMBARGO, init_frac=0.25):
     n = len(X); start = int(n * init_frac)
     b = np.linspace(start, n, n_splits + 1).astype(int)
     oos = np.full(n, np.nan)
@@ -46,6 +57,20 @@ def oos_prob(df, want, target):
     cols = [c for c in feat_cols(df) if group_of(c) in want]
     X = df[cols]; y = df[target].astype(int)
     return np.nanmean([wf(X, y, s) for s in SEEDS], axis=0)
+
+def live_prob(df, want, target, i):
+    """Point-in-time prob for row i: train on [0, i-EMBARGO), predict row i.
+    Same guards and seed-averaging as wf() — the live continuation of the backtest."""
+    cols = [c for c in feat_cols(df) if group_of(c) in want]
+    X = df[cols]; y = df[target].astype(int)
+    tr = i - EMBARGO
+    if tr < 100 or y.iloc[:tr].sum() < 4:
+        return float("nan")
+    ps = []
+    for s in SEEDS:
+        m = cb(s); m.fit(X.iloc[:tr], y.iloc[:tr])
+        ps.append(m.predict_proba(X.iloc[[i]])[:, 1][0])
+    return float(np.mean(ps))
 
 def flag(prob, q, minhist=252):
     """CAUSAL flagging: rising edge + EXPANDING-WINDOW quantile (past probabilities only).
@@ -68,18 +93,47 @@ def flag(prob, q, minhist=252):
         seen.append(p[i])                      # add today AFTER deciding (no peeking)
     return out
 
+def bootstrap(df):
+    print("bootstrap: no probs.csv — generating full walk-forward prob history (one-time)")
+    return pd.DataFrame({
+        "date": df["date"].dt.strftime("%Y-%m-%d"),
+        "top_prob": oos_prob(df, TOP_GROUPS, "y_top"),
+        "bottom_prob": oos_prob(df, BOT_GROUPS, "y_bottom"),
+    })
+
+def append_new(df, probs):
+    last = probs["date"].iloc[-1]
+    dstr = df["date"].dt.strftime("%Y-%m-%d")
+    new_pos = np.flatnonzero(dstr.to_numpy() > last)
+    if len(new_pos) == 0:
+        print(f"no new dates after {last} — signals unchanged")
+        return probs
+    rows = []
+    for i in new_pos:
+        rows.append({"date": dstr.iloc[i],
+                     "top_prob": live_prob(df, TOP_GROUPS, "y_top", i),
+                     "bottom_prob": live_prob(df, BOT_GROUPS, "y_bottom", i)})
+        print(f"appended {dstr.iloc[i]}: top={rows[-1]['top_prob']:.4f} "
+              f"bottom={rows[-1]['bottom_prob']:.4f}")
+    return pd.concat([probs, pd.DataFrame(rows)], ignore_index=True)
+
 def main():
     df = load().reset_index(drop=True)
-    top_p = oos_prob(df, TOP_GROUPS, "y_top")
-    bot_p = oos_prob(df, BOT_GROUPS, "y_bottom")
+    if os.path.exists(PROBS_PATH):
+        # round_trip parser: read floats to the exact stored value so rewriting the
+        # file is byte-stable (git diff of probs.csv shows only appended lines)
+        probs = append_new(df, pd.read_csv(PROBS_PATH, dtype={"date": str},
+                                           float_precision="round_trip"))
+    else:
+        probs = bootstrap(df)
+    probs.to_csv(PROBS_PATH, index=False)
     out = pd.DataFrame({
-        "date": df["date"].dt.strftime("%Y-%m-%d"),
-        "top": flag(top_p, TOP_Q),
-        "bottom": flag(bot_p, BOT_Q),
+        "date": probs["date"],
+        "top": flag(probs["top_prob"].to_numpy(float), TOP_Q),
+        "bottom": flag(probs["bottom_prob"].to_numpy(float), BOT_Q),
     })
-    path = os.path.join(ROOT, "data", "signals.csv")
-    out.to_csv(path, index=False)
-    print(f"wrote {path}: {len(out)} rows | top signals={int(out['top'].sum())} "
+    out.to_csv(SIGNALS_PATH, index=False)
+    print(f"wrote {SIGNALS_PATH}: {len(out)} rows | top signals={int(out['top'].sum())} "
           f"bottom signals={int(out['bottom'].sum())}")
     print("recent top dates:", list(out[out.top==1].date.tail(6)))
     print("recent bottom dates:", list(out[out.bottom==1].date.tail(6)))

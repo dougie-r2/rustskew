@@ -53,6 +53,11 @@ Q=0.95 uv run --with pandas --with numpy python ml/reflag.py   # causal signals.
 - **Signals must be CAUSAL.** The TabPFN probability is point-in-time, but flagging must not
   peek the future. Use `reflag.py`'s **rising-edge** (fire the first day prob crosses above
   the threshold) — NOT a ±N local-max window (that needs future days, hindsight-only).
+- **Published signals are IMMUTABLE (no repainting).** `data/probs.csv` is the append-only
+  point-in-time prob record; daily CI (`ml/gen_signals.py`) trains up to t−5 and appends ONLY
+  new dates, then `data/signals.csv` is recomputed as a pure function of the frozen probs —
+  so historical flags never move. Never regenerate past prob rows; deleting `data/probs.csv`
+  forces a one-time full walk-forward rebuild (research only — it rewrites published history).
 - **TabPFN needs a GPU** (RTX 2080 here); CI has none. So: CI auto-updates price/snapshots/
   panels via CatBoost-free steps; **regenerate TabPFN signals locally and commit** them.
   Always `nvidia-smi` and kill leftover TabPFN procs (`pkill -9 -f`) before a run — a zombie
